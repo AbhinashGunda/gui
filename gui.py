@@ -1,323 +1,322 @@
-import threading
-import queue
-import time
-import paramiko
+# poc_tk_sqlite_hierarchical.py
+import sqlite3 as s3
 import tkinter as tk
-from tkinter import ttk
-from tkinter import messagebox
-from tkinter import scrolledtext
+from tkinter import ttk, messagebox, filedialog
+import pandas as pd
+import os
 
+DB = "poc.db"
 
-# ------------------------------
-# SSH session helper (background)
-# ------------------------------
-class SSHSession:
+# ---------- DB ----------
+def g():
+    c = s3.connect(DB)
+    c.execute("PRAGMA foreign_keys = ON")
+    return c
+
+def init_db():
+    c = g(); cur = c.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS author (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            email TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS book (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            year INTEGER,
+            author_id INTEGER NOT NULL,
+            FOREIGN KEY(author_id) REFERENCES author(id) ON DELETE CASCADE
+        )
+    """)
+    c.commit(); c.close()
+
+# ---------- UI refresh ----------
+def r_authors():
+    c = g(); cur = c.cursor()
+    cur.execute("SELECT id, name FROM author ORDER BY name")
+    rows = cur.fetchall(); c.close()
+    vals = [f"{r[0]} - {r[1]}" for r in rows]
+    cmb_author['values'] = vals
+    lb_authors.delete(0, tk.END)
+    for v in vals:
+        lb_authors.insert(tk.END, v)
+
+def r_books():
+    c = g(); cur = c.cursor()
+    cur.execute("""
+        SELECT book.id, book.title, book.year, author.name
+        FROM book JOIN author ON book.author_id = author.id
+        ORDER BY book.id DESC
+    """)
+    rows = cur.fetchall(); c.close()
+    tv_books.delete(*tv_books.get_children())
+    for r in rows:
+        tv_books.insert("", tk.END, values=r)
+
+# ---------- single-row insert ----------
+def add_author_ui():
+    n = ent_author_name.get().strip(); e = ent_author_email.get().strip()
+    if not n:
+        messagebox.showerror("Validation", "Author name required."); return
+    c = g(); cur = c.cursor()
+    try:
+        cur.execute("INSERT OR IGNORE INTO author(name, email) VALUES (?, ?)", (n, e or None))
+        if cur.rowcount == 0 and e:
+            cur.execute("UPDATE author SET email=? WHERE name=?", (e, n))
+        c.commit()
+    except Exception as ex:
+        messagebox.showerror("DB Error", str(ex))
+    finally:
+        c.close()
+    ent_author_name.delete(0, tk.END); ent_author_email.delete(0, tk.END)
+    r_authors(); messagebox.showinfo("Saved", f"Author '{n}' added/updated.")
+
+def add_book_ui():
+    t = ent_book_title.get().strip(); y = ent_book_year.get().strip(); a = cmb_author.get().strip()
+    if not t:
+        messagebox.showerror("Validation", "Book title required."); return
+    if not a:
+        messagebox.showerror("Validation", "Select an author."); return
+    try:
+        aid = int(a.split(" - ")[0])
+    except Exception:
+        messagebox.showerror("Validation", "Invalid author selection."); return
+    try:
+        yv = int(y) if y else None
+    except Exception:
+        messagebox.showerror("Validation", "Year must be a number."); return
+    c = g(); cur = c.cursor()
+    try:
+        cur.execute("INSERT INTO book(title, year, author_id) VALUES (?, ?, ?)", (t, yv, aid))
+        c.commit()
+    except Exception as ex:
+        messagebox.showerror("DB Error", str(ex))
+    finally:
+        c.close()
+    ent_book_title.delete(0, tk.END); ent_book_year.delete(0, tk.END)
+    r_books(); messagebox.showinfo("Saved", f"Book '{t}' added.")
+
+# ---------- helpers for upload ----------
+def get_or_create_author_by_name(nm):
+    n = str(nm).strip()
+    if not n or n.lower() == "nan": return None
+    c = g(); cur = c.cursor()
+    cur.execute("SELECT id FROM author WHERE name = ?", (n,))
+    r = cur.fetchone()
+    if r:
+        aid = r[0]; c.close(); return aid
+    try:
+        cur.execute("INSERT INTO author(name, email) VALUES (?, ?)", (n, None))
+        c.commit()
+        aid = cur.lastrowid
+    except Exception:
+        cur.execute("SELECT id FROM author WHERE name = ?", (n,))
+        r2 = cur.fetchone(); aid = r2[0] if r2 else None
+    c.close(); return aid
+
+def parse_key_value_pairs_from_df(df):
     """
-    Handles the paramiko SSH connection and background receiving of data.
-    Received text is put into self.recv_queue for the GUI to read safely.
+    Accepts a dataframe read from the sheet (no header).
+    Supports:
+    - two-column rows: key in col0, value in col1
+    - single-column vertical pairs: key row followed by value row
+    Returns list of (key, value) pairs in order.
     """
-
-    def __init__(self, recv_queue=None):
-        self.client = None
-        self.shell = None
-        self.recv_thread = None
-        self.stop_event = threading.Event()
-        # Queue where incoming terminal lines are placed for GUI
-        self.recv_queue = recv_queue if recv_queue is not None else queue.Queue()
-
-    def connect(self, hostname, port, username, password, timeout=10):
-        """
-        Attempt to connect to an SSH server and start a PTY shell.
-        Returns (True, None) on success or (False, error_message) on failure.
-        """
-        try:
-            # Create client and auto-accept host key (simple behavior)
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            # Connect (paramiko handles authentication)
-            self.client.connect(hostname=hostname, port=int(port),
-                                username=username, password=password, timeout=timeout)
-
-            # Open a shell (interactive pty)
-            self.shell = self.client.invoke_shell()
-            self.shell.settimeout(0.0)  # non-blocking reads
-
-            # Clear any previous stop event and start receiving thread
-            self.stop_event.clear()
-            self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
-            self.recv_thread.start()
-
-            return True, None
-        except Exception as e:
-            # Clean up on error
-            self.close()
-            return False, str(e)
-
-    def _recv_loop(self):
-        """
-        Loop running in background thread to read shell output.
-        We use non-blocking recv and collect available data repeatedly.
-        All output is pushed into self.recv_queue for the GUI to handle.
-        """
-        try:
-            while not self.stop_event.is_set():
-                if self.shell is None:
-                    break
-                try:
-                    if self.shell.recv_ready():
-                        # Read up to 4096 bytes
-                        data = self.shell.recv(4096)
-                        if not data:
-                            # Connection closed at remote side
-                            self.recv_queue.put("\n[connection closed by remote]\n")
-                            break
-                        # decode and put into queue
-                        text = data.decode(errors="ignore")
-                        self.recv_queue.put(text)
-                    else:
-                        # nothing ready; sleep briefly
-                        time.sleep(0.05)
-                except Exception:
-                    # If socket times out or another read error happens, sleep briefly
-                    time.sleep(0.05)
-                    continue
-        finally:
-            # ensure cleanup
-            self.close()
-
-    def send(self, data: str):
-        """Send raw data to the shell (must include newline if needed)."""
-        try:
-            if self.shell is not None:
-                self.shell.send(data)
+    pairs = []
+    # normalize columns to strings
+    # handle if df has >=2 columns and there are many non-nulls in col1 => prefer same-row pairs
+    if df.shape[1] >= 2 and df.iloc[:,1].notna().any():
+        for _, r in df.iterrows():
+            k = r.iloc[0]; v = r.iloc[1]
+            if pd.isna(k): continue
+            if pd.isna(v):
+                # if value missing in col1, try to take next non-null row in col0 as value (vertical style)
+                continue
+            pairs.append((str(k).strip(), str(v).strip()))
+        # Also detect single-column vertical entries if above missed some
+        # (fall through later if needed)
+    else:
+        # single-column or second column empty -> interpret as vertical pairs
+        col0 = df.iloc[:,0].tolist()
+        i = 0
+        n = len(col0)
+        while i < n:
+            k = col0[i]
+            if pd.isna(k) or str(k).strip() == "":
+                i += 1; continue
+            kstr = str(k).strip()
+            # find next non-empty value row
+            v = None
+            j = i+1
+            while j < n:
+                cand = col0[j]
+                if not pd.isna(cand) and str(cand).strip() != "":
+                    v = str(cand).strip(); break
+                j += 1
+            if v is not None:
+                pairs.append((kstr, v))
+                i = j+1
             else:
-                raise RuntimeError("Shell is not available.")
-        except Exception as e:
-            # Inform GUI via queue
-            self.recv_queue.put(f"\n[send error] {e}\n")
+                # no value found, skip
+                i += 1
+    return pairs
 
-    def close(self):
-        """Stop receive loop and close shell and client."""
+def parse_hierarchical_pairs(pairs):
+    """
+    Given list of (key, value) pairs like ('author>name','Alice'), ('book>title','X')
+    Produce lists of author dicts and book dicts.
+    Heuristic: when encountering an 'author>name' while a current_author exists -> start new author.
+               when encountering a 'book>title' while current_book exists -> start new book.
+    """
+    authors = []
+    books = []
+    cur_a = {}
+    cur_b = {}
+    for k, v in pairs:
+        if ">" not in k: continue
+        ent, fld = [x.strip() for x in k.split(">", 1)]
+        if ent.lower() == "author":
+            # start new author if we see name and cur_a already has data
+            if fld.lower() == "name" and cur_a:
+                authors.append(cur_a); cur_a = {}
+            cur_a[fld.lower()] = v
+        elif ent.lower() == "book":
+            if fld.lower() == "title" and cur_b:
+                books.append(cur_b); cur_b = {}
+            cur_b[fld.lower()] = v
+        else:
+            # ignore unknown prefixes for now
+            pass
+    if cur_a: authors.append(cur_a)
+    if cur_b: books.append(cur_b)
+    return authors, books
+
+# ---------- upload hierarchical Excel ----------
+def upload_hierarchical():
+    fp = filedialog.askopenfilename(title="Select hierarchical Excel", filetypes=[("Excel files","*.xlsx *.xls")])
+    if not fp: return
+    if not os.path.exists(fp):
+        messagebox.showerror("File Error", "Selected file does not exist."); return
+
+    msgs = []; ia = 0; ib = 0; sk = 0
+    try:
+        xls = pd.ExcelFile(fp)
+    except Exception as ex:
+        messagebox.showerror("Read Error", f"Failed to open Excel: {ex}"); return
+
+    # We'll parse the first sheet by default (user's hierarchical sheet)
+    sheet = xls.sheet_names[0]
+    try:
+        df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
+    except Exception as ex:
+        messagebox.showerror("Read Error", f"Failed to read sheet '{sheet}': {ex}"); return
+
+    pairs = parse_key_value_pairs_from_df(df)
+    if not pairs:
+        messagebox.showerror("Parse Error", "No key-value pairs detected in the sheet."); return
+
+    authors_list, books_list = parse_hierarchical_pairs(pairs)
+
+    c = g(); cur = c.cursor()
+
+    # insert authors
+    for idx, a in enumerate(authors_list):
+        name = a.get("name") or a.get("author>name") or a.get("author_name")
+        email = a.get("email") or a.get("author>email")
+        if not name or str(name).strip().lower() == "nan":
+            sk += 1; msgs.append(f"Author block {idx+1} skipped: missing name"); continue
+        n = str(name).strip(); e = None if email is None or pd.isna(email) else str(email).strip()
         try:
-            self.stop_event.set()
+            cur.execute("INSERT OR IGNORE INTO author(name, email) VALUES (?, ?)", (n, e))
+            if cur.rowcount == 0 and e:
+                cur.execute("UPDATE author SET email=? WHERE name=?", (e, n))
+            ia += 1
+        except Exception as ex:
+            sk += 1; msgs.append(f"Author block {idx+1} skipped: {ex}")
+
+    # insert books
+    for idx, b in enumerate(books_list):
+        title = b.get("title") or b.get("book>title")
+        year = b.get("year") or b.get("book>year")
+        ba = b.get("author") or b.get("book>author")
+        if not title or str(title).strip().lower() == "nan":
+            sk += 1; msgs.append(f"Book block {idx+1} skipped: missing title"); continue
+        if not ba or str(ba).strip().lower() == "nan":
+            sk += 1; msgs.append(f"Book block {idx+1} skipped: missing book>author"); continue
+        t = str(title).strip()
+        try:
+            yv = int(year) if (year is not None and not pd.isna(year) and str(year).strip() != "") else None
         except Exception:
-            pass
+            yv = None
+        # locate or create author by name
         try:
-            if self.shell is not None:
-                self.shell.close()
-        except Exception:
-            pass
+            aid = get_or_create_author_by_name(ba)
+            if aid is None:
+                sk += 1; msgs.append(f"Book block {idx+1} skipped: invalid author '{ba}'"); continue
+        except Exception as ex:
+            sk += 1; msgs.append(f"Book block {idx+1} skipped: failed create/find author '{ba}' ({ex})"); continue
         try:
-            if self.client is not None:
-                self.client.close()
-        except Exception:
-            pass
-        self.shell = None
-        self.client = None
+            cur.execute("INSERT INTO book(title, year, author_id) VALUES (?, ?, ?)", (t, yv, aid))
+            ib += 1
+        except Exception as ex:
+            sk += 1; msgs.append(f"Book block {idx+1} skipped: {ex}")
 
+    c.commit(); c.close()
+    r_authors(); r_books()
 
-# ------------------------------
-# Main GUI Application
-# ------------------------------
-class App:
-    def __init__(self, root):
-        self.root = root
-        root.title("SSH + pbrun Automator")
-        root.geometry("900x600")
+    summary = f"Upload complete — authors processed: {ia}, books inserted: {ib}, rows skipped: {sk}."
+    if msgs:
+        detail = "\n".join(msgs[:12])
+        if len(msgs) > 12:
+            detail += f"\n...and {len(msgs)-12} more."
+        messagebox.showinfo("Upload result", summary + "\n\nDetails:\n" + detail)
+    else:
+        messagebox.showinfo("Upload result", summary)
 
-        # Queue for incoming terminal data
-        self.recv_queue = queue.Queue()
+# ---------- build UI ----------
+init_db()
+root = tk.Tk()
+root.title("POC: Tkinter + SQLite (hierarchical Excel upload)")
+root.geometry("920x560")
 
-        # Create SSH session object (it places incoming text into recv_queue)
-        self.sess = SSHSession(recv_queue=self.recv_queue)
+# Author
+fa = ttk.LabelFrame(root, text="Author"); fa.pack(fill="x", padx=10, pady=6)
+ttk.Label(fa, text="Name").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+ent_author_name = ttk.Entry(fa, width=30); ent_author_name.grid(row=0, column=1, padx=6, pady=6, sticky="w")
+ttk.Label(fa, text="Email").grid(row=0, column=2, padx=6, pady=6, sticky="w")
+ent_author_email = ttk.Entry(fa, width=30); ent_author_email.grid(row=0, column=3, padx=6, pady=6, sticky="w")
+btn_add_author = ttk.Button(fa, text="Add Author", command=add_author_ui); btn_add_author.grid(row=0, column=4, padx=6, pady=6)
+lb_authors = tk.Listbox(fa, height=4); lb_authors.grid(row=1, column=0, columnspan=4, padx=6, pady=(0,8), sticky="we")
+ttk.Label(fa, text="(id - name)").grid(row=1, column=4, padx=6, sticky="w")
 
-        # Build the GUI (top form, buttons, terminal, input)
-        self._build_form()
-        # Start periodic check to pull text from recv_queue to the GUI
-        self._schedule_poll_recv()
+# Book
+fb = ttk.LabelFrame(root, text="Book"); fb.pack(fill="x", padx=10, pady=6)
+ttk.Label(fb, text="Title").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+ent_book_title = ttk.Entry(fb, width=30); ent_book_title.grid(row=0, column=1, padx=6, pady=6, sticky="w")
+ttk.Label(fb, text="Year").grid(row=0, column=2, padx=6, pady=6, sticky="w")
+ent_book_year = ttk.Entry(fb, width=10); ent_book_year.grid(row=0, column=3, padx=6, pady=6, sticky="w")
+ttk.Label(fb, text="Author").grid(row=0, column=4, padx=6, pady=6, sticky="w")
+cmb_author = ttk.Combobox(fb, state="readonly", width=30); cmb_author.grid(row=0, column=5, padx=6, pady=6, sticky="w")
+btn_add_book = ttk.Button(fb, text="Add Book", command=add_book_ui); btn_add_book.grid(row=0, column=6, padx=6, pady=6)
 
-    def _build_form(self):
-        frm = ttk.Frame(self.root, padding=8)
-        frm.grid(row=0, column=0, sticky="nsew")
-        # allow resizing
-        self.root.rowconfigure(0, weight=1)
-        self.root.columnconfigure(0, weight=1)
-        frm.rowconfigure(4, weight=1)  # terminal row grows
+# Upload frame
+fu = ttk.Frame(root); fu.pack(fill="x", padx=10, pady=6)
+ttk.Label(fu, text="Bulk actions:").grid(row=0, column=0, padx=6, sticky="w")
+btn_upload1 = ttk.Button(fu, text="Upload hierarchical Excel (key-value)", command=upload_hierarchical); btn_upload1.grid(row=0, column=1, padx=6, sticky="w")
+ttk.Label(fu, text="Sheet format: key-value pairs. Keys like author>name, author>email, book>title, book>year, book>author").grid(row=0, column=2, padx=12, sticky="w")
 
-        # --- Row 0: host / port / user / password ---
-        ttk.Label(frm, text="Host").grid(row=0, column=0, sticky="w")
-        self.host_e = ttk.Entry(frm, width=20)
-        self.host_e.grid(row=0, column=1, sticky="w")
+# Books treeview
+ft = ttk.LabelFrame(root, text="Saved Books"); ft.pack(fill="both", expand=True, padx=10, pady=6)
+cols = ("id", "title", "year", "author")
+tv_books = ttk.Treeview(ft, columns=cols, show="headings", height=14)
+tv_books.heading("id", text="ID"); tv_books.heading("title", text="Title")
+tv_books.heading("year", text="Year"); tv_books.heading("author", text="Author")
+tv_books.column("id", width=50, anchor="center"); tv_books.column("title", width=420)
+tv_books.column("year", width=70, anchor="center"); tv_books.column("author", width=260)
+tv_books.pack(fill="both", expand=True, padx=6, pady=6)
 
-        ttk.Label(frm, text="Port").grid(row=0, column=2, sticky="w", padx=(10, 0))
-        self.port_e = ttk.Entry(frm, width=6)
-        self.port_e.insert(0, "22")
-        self.port_e.grid(row=0, column=3, sticky="w")
-
-        ttk.Label(frm, text="SSH Username").grid(row=0, column=4, sticky="w", padx=(10, 0))
-        self.user_e = ttk.Entry(frm, width=20)
-        self.user_e.grid(row=0, column=5, sticky="w")
-
-        ttk.Label(frm, text="SSH Password").grid(row=0, column=6, sticky="w", padx=(10, 0))
-        self.pass_e = ttk.Entry(frm, width=20, show="*")
-        self.pass_e.grid(row=0, column=7, sticky="w")
-
-        # --- Row 1: pbrun target and pbrun password ---
-        ttk.Label(frm, text="pbrun Target User").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self.target_e = ttk.Entry(frm, width=20)
-        self.target_e.grid(row=1, column=1, sticky="w", pady=(6, 0))
-
-        ttk.Label(frm, text="pbrun Password").grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(6, 0))
-        self.pbrun_pass_e = ttk.Entry(frm, width=20, show="*")
-        self.pbrun_pass_e.grid(row=1, column=3, sticky="w", pady=(6, 0))
-
-        # --- Row 2: Buttons: Connect, Run pbrun -> shell, Disconnect ---
-        self.connect_btn = ttk.Button(frm, text="Connect", command=self.on_connect)
-        self.connect_btn.grid(row=2, column=0, pady=8)
-
-        self.pbrun_btn = ttk.Button(frm, text="Run pbrun -> shell", command=self.on_pbrun, state="disabled")
-        self.pbrun_btn.grid(row=2, column=1, padx=(6, 0), pady=8)
-
-        self.disconnect_btn = ttk.Button(frm, text="Disconnect", command=self.on_disconnect, state="disabled")
-        self.disconnect_btn.grid(row=2, column=2, padx=(6, 0), pady=8)
-
-        # --- Row 4: Terminal output (scrolled text) ---
-        self.terminal = scrolledtext.ScrolledText(frm, wrap="char", width=120, height=24, state="disabled")
-        self.terminal.grid(row=4, column=0, columnspan=8, sticky="nsew", pady=(6, 0))
-
-        # --- Row 5: Input line and Send button ---
-        self.cmd_entry = ttk.Entry(frm, width=100)
-        self.cmd_entry.grid(row=5, column=0, columnspan=6, sticky="we", pady=(6, 0))
-        self.cmd_entry.bind("<Return>", self.on_send_cmd)
-
-        self.send_btn = ttk.Button(frm, text="Send", command=self.on_send_cmd)
-        self.send_btn.grid(row=5, column=6, sticky="w", padx=(6, 0), pady=(6, 0))
-
-    # -------------------
-    # Terminal helpers
-    # -------------------
-    def _append_to_terminal(self, text: str):
-        """Safely append text to the scrolled text widget (must be called from main thread)."""
-        if not text:
-            return
-        self.terminal.configure(state="normal")
-        self.terminal.insert("end", text)
-        self.terminal.see("end")
-        self.terminal.configure(state="disabled")
-
-    def _schedule_poll_recv(self):
-        """
-        Periodically called in the GUI main thread to flush recv_queue into the terminal.
-        This keeps GUI updates in the main thread and avoids thread-safety issues.
-        """
-        try:
-            while True:
-                text = self.recv_queue.get_nowait()
-                self._append_to_terminal(text)
-        except queue.Empty:
-            pass
-        # call this method again after 100ms
-        self.root.after(100, self._schedule_poll_recv)
-
-    # -------------------
-    # Button callbacks
-    # -------------------
-    def on_connect(self):
-        host = self.host_e.get().strip()
-        port = self.port_e.get().strip() or "22"
-        user = self.user_e.get().strip()
-        pwd = self.pass_e.get().strip()
-        if not (host and user and pwd):
-            messagebox.showwarning("Missing", "Host, SSH username and password are required")
-            return
-
-        # disable connect button during attempt
-        self.connect_btn.config(state="disabled")
-        self.terminal.configure(state="normal")
-        self.terminal.delete("1.0", "end")
-        self.terminal.configure(state="disabled")
-
-        def worker():
-            ok, err = self.sess.connect(host, port, user, pwd)
-            if not ok:
-                self.recv_queue.put(f"\nConnection failed: {err}\n")
-                # re-enable connect button
-                self.connect_btn.config(state="normal")
-                return
-
-            # connected successfully -> enable pbrun & disconnect
-            self.recv_queue.put(f"\nConnected to {host} as {user}\n")
-            self.pbrun_btn.config(state="normal")
-            self.disconnect_btn.config(state="normal")
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def on_pbrun(self):
-        """
-        Send the pbrun command to start a shell as another user, then wait briefly for
-        a password prompt and send the pbrun password automatically.
-        """
-        target = self.target_e.get().strip()
-        pbrun_pwd = self.pbrun_pass_e.get().strip()
-        if not target:
-            messagebox.showwarning("Missing", "Please supply the pbrun target user")
-            return
-
-        # form the command (adjust if your system uses different pbrun syntax)
-        # Example: pbrun -u <target> bash -l
-        cmd = f"pbrun -u {target} bash\n"
-        self.sess.send(cmd)
-        self.recv_queue.put(f"\nRunning: {cmd}")
-
-        # Wait in separate thread for a password prompt
-        def waiter():
-            timeout = 8
-            start = time.time()
-            seen_buff = ""
-            while time.time() - start < timeout:
-                try:
-                    chunk = self.recv_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                # accumulate small output and check for password prompt keywords
-                seen_buff += chunk.lower()
-                if ("password:" in seen_buff) or ("password for" in seen_buff):
-                    # send pbrun password + newline
-                    if pbrun_pwd:
-                        self.sess.send(pbrun_pwd + "\n")
-                        self.recv_queue.put("\n[pbrun password sent]\n")
-                    else:
-                        self.recv_queue.put("\n[pbrun password prompt seen but no password supplied]\n")
-                    return
-            # timeout without seeing password prompt
-            self.recv_queue.put("\n[pbrun password prompt not detected - password not sent]\n")
-
-        threading.Thread(target=waiter, daemon=True).start()
-
-    def on_send_cmd(self, event=None):
-        cmd = self.cmd_entry.get()
-        if not cmd:
-            return
-        # ensure newline
-        if not cmd.endswith("\n"):
-            cmd = cmd + "\n"
-        self.sess.send(cmd)
-        # clear entry
-        self.cmd_entry.delete(0, "end")
-
-    def on_disconnect(self):
-        self.sess.close()
-        self.recv_queue.put("\n[connection closed]\n")
-        self.connect_btn.config(state="normal")
-        self.pbrun_btn.config(state="disabled")
-        self.disconnect_btn.config(state="disabled")
-
-
-# ------------------------------
-# Run the app
-# ------------------------------
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+r_authors(); r_books()
+root.mainloop()
